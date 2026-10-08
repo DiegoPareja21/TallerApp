@@ -1,6 +1,7 @@
-// Reconocimiento del coche en el propio móvil, gratis y sin internet:
-// - Google ML Kit lee los textos de la foto (matrícula, nombre del modelo, marca escrita).
-// - El color se calcula analizando los píxeles de la carrocería.
+// Reconocimiento del coche a partir de una foto, con dos motores gratuitos para leer el texto:
+// - Google ML Kit: en el propio móvil y sin internet. Solo en la app de desarrollo (Android).
+// - OCR.space: en la nube (plan gratuito). Funciona en Expo Go y en iPhone.
+// La matrícula, la marca y el modelo salen de esos textos; el color, de los píxeles de la carrocería.
 import type { Text } from '@infinitered/react-native-mlkit-text-recognition';
 import { requireOptionalNativeModule } from 'expo';
 import { ImageManipulator, SaveFormat } from 'expo-image-manipulator';
@@ -9,12 +10,9 @@ import { LecturaMatricula, leerMatricula, normalizarMatricula } from './matricul
 import { detectarMarcaModelo } from './vehiculos';
 
 type Frame = { left: number; top: number; width: number; height: number };
-const aFrame = (r: { left: number; top: number; right: number; bottom: number }): Frame => ({
-  left: r.left,
-  top: r.top,
-  width: r.right - r.left,
-  height: r.bottom - r.top,
-});
+type Linea = { texto: string; frame: Frame };
+/** Textos leídos, con su posición en una imagen de tamaño ancho × alto. */
+type Lectura = { lineas: Linea[]; extras: Linea[]; ancho: number; alto: number };
 
 export type DatosDetectados = {
   matricula?: string;
@@ -23,33 +21,106 @@ export type DatosDetectados = {
   color?: string;
   colorSeguro: boolean;
   textos: string[];
+  motor: 'ML Kit' | 'OCR.space';
 };
 
-/** ML Kit es código nativo: no existe en Expo Go, solo en la app de desarrollo propia. */
-export const reconocimientoDisponible = () => !!requireOptionalNativeModule('RNMLKitTextRecognition');
+const OCR_KEY = process.env.EXPO_PUBLIC_OCRSPACE_API_KEY;
+const mlKitDisponible = () => !!requireOptionalNativeModule('RNMLKitTextRecognition');
 
-// Se carga solo al usarlo: importarlo en Expo Go rompería la app entera
-async function leerTextos(uri: string): Promise<Text> {
+export const reconocimientoDisponible = () => mlKitDisponible() || !!OCR_KEY;
+
+// ---------- Motor 1: ML Kit (en el móvil) ----------
+
+const desdeRect = (r: { left: number; top: number; right: number; bottom: number }): Frame => ({
+  left: r.left,
+  top: r.top,
+  width: r.right - r.left,
+  height: r.bottom - r.top,
+});
+
+async function leerConMlKit(uri: string, ancho: number, alto: number): Promise<Lectura> {
+  // Se carga solo al usarlo: importarlo en Expo Go rompería la app entera
   const { recognizeText } = require('@infinitered/react-native-mlkit-text-recognition') as typeof import('@infinitered/react-native-mlkit-text-recognition');
-  return recognizeText(uri);
+  const r: Text = await recognizeText(uri);
+  return {
+    lineas: r.blocks.flatMap((b) => b.lines.map((l) => ({ texto: l.text, frame: desdeRect(l.frame) }))),
+    // El bloque entero también cuenta: a veces la placa sale partida en dos líneas
+    extras: r.blocks.map((b) => ({ texto: b.text, frame: desdeRect(b.frame) })),
+    ancho,
+    alto,
+  };
+}
+
+// ---------- Motor 2: OCR.space (en la nube) ----------
+
+type OcrSpaceWord = { WordText: string; Left: number; Top: number; Width: number; Height: number };
+type OcrSpaceRespuesta = {
+  OCRExitCode: number;
+  IsErroredOnProcessing: boolean;
+  ErrorMessage?: string | string[];
+  ParsedResults?: { TextOverlay?: { Lines: { LineText: string; Words: OcrSpaceWord[] }[] } }[];
+};
+
+/** Reduce la foto por debajo de 1 MB, el límite del plan gratuito. */
+async function prepararParaOcr(uri: string) {
+  for (const [ancho, calidad] of [[1600, 0.7], [1200, 0.6], [900, 0.5]] as const) {
+    const ctx = ImageManipulator.manipulate(uri);
+    ctx.resize({ width: ancho });
+    const ref = await ctx.renderAsync();
+    const img = await ref.saveAsync({ format: SaveFormat.JPEG, compress: calidad, base64: true });
+    if (img.base64 && img.base64.length * 0.75 < 950_000) return { base64: img.base64, ancho: img.width, alto: img.height };
+  }
+  throw new Error('La foto es demasiado grande para analizarla.');
+}
+
+async function leerConOcrSpace(uri: string): Promise<Lectura> {
+  const img = await prepararParaOcr(uri);
+  const form = new FormData();
+  form.append('base64Image', `data:image/jpeg;base64,${img.base64}`);
+  form.append('OCREngine', '2');
+  form.append('isOverlayRequired', 'true');
+  form.append('detectOrientation', 'true');
+  form.append('scale', 'true');
+
+  let res: Response;
+  try {
+    res = await fetch('https://api.ocr.space/parse/image', { method: 'POST', headers: { apikey: OCR_KEY! }, body: form });
+  } catch {
+    throw new Error('Sin conexión con el lector de matrículas. Revisa internet o rellena los datos a mano.');
+  }
+  if (res.status === 403 || res.status === 401) throw new Error('La clave de OCR.space no es válida.');
+  if (!res.ok) throw new Error(`El lector de matrículas no responde (${res.status}). Prueba en un momento.`);
+
+  const json = (await res.json()) as OcrSpaceRespuesta;
+  if (json.IsErroredOnProcessing || json.OCRExitCode > 2) {
+    const msg = Array.isArray(json.ErrorMessage) ? json.ErrorMessage[0] : json.ErrorMessage;
+    throw new Error(`No se pudo leer la foto${msg ? `: ${msg}` : '.'}`);
+  }
+
+  const lineas: Linea[] = (json.ParsedResults?.[0]?.TextOverlay?.Lines ?? []).map((l) => {
+    const left = Math.min(...l.Words.map((w) => w.Left));
+    const top = Math.min(...l.Words.map((w) => w.Top));
+    const right = Math.max(...l.Words.map((w) => w.Left + w.Width));
+    const bottom = Math.max(...l.Words.map((w) => w.Top + w.Height));
+    return { texto: l.LineText, frame: { left, top, width: right - left, height: bottom - top } };
+  });
+  // Parejas de líneas seguidas, por si la placa se ha leído partida
+  const extras = lineas.slice(1).map((l, i) => ({ texto: `${lineas[i].texto} ${l.texto}`, frame: lineas[i].frame }));
+  return { lineas, extras, ancho: img.ancho, alto: img.alto };
 }
 
 // ---------- Matrícula ----------
 
-type Plato = LecturaMatricula & { alto: number; frame: Frame };
+type Plato = LecturaMatricula & { frame: Frame };
 
-function buscarMatricula(r: Text): Plato | undefined {
+function buscarMatricula(l: Lectura): Plato | undefined {
   const candidatos: Plato[] = [];
-  for (const bloque of r.blocks) {
-    // Se prueba línea a línea y también el bloque entero (a veces la placa sale partida en dos líneas)
-    const piezas = [...bloque.lines.map((l) => ({ t: l.text, f: aFrame(l.frame) })), { t: bloque.text, f: aFrame(bloque.frame) }];
-    for (const { t, f } of piezas) {
-      const lectura = leerMatricula(t);
-      if (lectura) candidatos.push({ ...lectura, alto: f.height, frame: f });
-    }
+  for (const { texto, frame } of [...l.lineas, ...l.extras]) {
+    const lectura = leerMatricula(texto);
+    if (lectura) candidatos.push({ ...lectura, frame });
   }
   // Mejor candidato: menos correcciones y, a igualdad, el texto más grande (la placa suele serlo)
-  return candidatos.sort((a, b) => a.correcciones - b.correcciones || b.alto - a.alto)[0];
+  return candidatos.sort((a, b) => a.correcciones - b.correcciones || b.frame.height - a.frame.height)[0];
 }
 
 // ---------- Color ----------
@@ -128,22 +199,25 @@ async function detectarColor(uri: string, ancho: number, alto: number, placa?: F
 // ---------- Todo junto ----------
 
 export async function reconocerCoche(uri: string, ancho: number, alto: number): Promise<DatosDetectados> {
-  if (!reconocimientoDisponible()) {
-    throw new Error('El escaneo necesita la app de desarrollo de AutoTaller (no funciona dentro de Expo Go). Rellena los datos a mano.');
+  const motor = mlKitDisponible() ? 'ML Kit' : OCR_KEY ? 'OCR.space' : null;
+  if (!motor) {
+    throw new Error(
+      'El escaneo no está configurado en este móvil: falta la clave gratuita de OCR.space (EXPO_PUBLIC_OCRSPACE_API_KEY en .env.local). Rellena los datos a mano.'
+    );
   }
-  const resultado = await leerTextos(uri);
-  const placa = buscarMatricula(resultado);
+  const lectura = motor === 'ML Kit' ? await leerConMlKit(uri, ancho, alto) : await leerConOcrSpace(uri);
+  const placa = buscarMatricula(lectura);
 
   // Para buscar el modelo se quitan las líneas de la matrícula (sus cifras podrían parecer un "2008" o un "500")
-  const textos = resultado.blocks.flatMap((b) => b.lines.map((l) => l.text)).filter((t) => {
-    const c = t.toUpperCase().replace(/[^A-Z0-9]/g, '');
-    return !placa || !c.includes(placa.texto.replace(/[^A-Z0-9]/g, '').slice(0, 4));
-  });
+  const cifrasPlaca = placa?.texto.replace(/[^A-Z0-9]/g, '').slice(0, 4);
+  const textos = lectura.lineas
+    .map((l) => l.texto)
+    .filter((t) => !cifrasPlaca || !t.toUpperCase().replace(/[^A-Z0-9]/g, '').includes(cifrasPlaca));
   const { marca, modelo } = detectarMarcaModelo(textos);
 
   let color: { color: string; seguro: boolean } | undefined;
   try {
-    color = await detectarColor(uri, ancho, alto, placa?.frame);
+    color = await detectarColor(uri, lectura.ancho, lectura.alto, placa?.frame);
   } catch {
     color = undefined;
   }
@@ -155,5 +229,6 @@ export async function reconocerCoche(uri: string, ancho: number, alto: number): 
     color: color?.color,
     colorSeguro: !!color?.seguro,
     textos,
+    motor,
   };
 }
