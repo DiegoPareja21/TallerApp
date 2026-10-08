@@ -1,0 +1,44 @@
+{
+  "expo": {
+    "name": "AutoTaller Pro",
+    "slug": "TallerApp",
+    "version": "1.0.0",
+    "orientation": "portrait",
+    "icon": "./assets/icon.png",
+    "userInterfaceStyle": "automatic",
+    "backgroundColor": "#0B1437",
+    "ios": {
+      "supportsTablet": true
+    },
+    "android": {
+      "package": "com.autotaller.pro",
+      "adaptiveIcon": {
+        "backgroundColor": "#0B1437",
+        "foregroundImage": "./assets/android-icon-foreground.png",
+        "backgroundImage": "./assets/android-icon-background.png",
+        "monochromeImage": "./assets/android-icon-monochrome.png"
+      },
+      "predictiveBackGestureEnabled": false
+    },
+    "web": {
+      "favicon": "./assets/favicon.png"
+    },
+    "plugins": [
+      "expo-image",
+      "expo-font",
+      [
+        "expo-image-picker",
+        {
+          "photosPermission": "Necesitamos acceso a tus fotos para añadir la imagen de tu coche.",
+          "cameraPermission": "Necesitamos la cámara para hacer una foto de tu coche."
+        }
+      ],
+      [
+        "expo-notifications",
+        {
+          "color": "#2F5BFF"
+        }
+      ]
+    ]
+  }
+}
